@@ -1,0 +1,379 @@
+name: Build CloudRedirect Release
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+
+  pull_request:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cloudredirect-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Build Windows release
+    runs-on: windows-2022
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~\.nuget\packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('ui/**/*.csproj') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Download trusted Steam API dependency
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path "ui\native" | Out-Null
+
+          $headers = @{
+            "Accept" = "application/vnd.github+json"
+            "User-Agent" = "CloudRedirect-build"
+          }
+
+          $releases = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/GMMan/SteamCloudFileManagerLite/releases" `
+            -Headers $headers
+
+          $asset = $null
+
+          foreach ($release in $releases) {
+            foreach ($candidate in $release.assets) {
+              if ($candidate.name -match '\.(zip|7z)$') {
+                $asset = $candidate
+                break
+              }
+            }
+
+            if ($null -ne $asset) {
+              break
+            }
+          }
+
+          if ($null -eq $asset) {
+            throw "Could not find a release archive from SteamCloudFileManagerLite."
+          }
+
+          $archive = Join-Path $env:RUNNER_TEMP $asset.name
+
+          Invoke-WebRequest `
+            -Uri $asset.browser_download_url `
+            -Headers $headers `
+            -OutFile $archive
+
+          $extract = Join-Path $env:RUNNER_TEMP "steamcloud-extract"
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+
+          if ($asset.name.EndsWith(".zip", [System.StringComparison]::OrdinalIgnoreCase)) {
+            Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
+          }
+          else {
+            throw "The downloaded release is not a ZIP archive. Download the verified DLL manually."
+          }
+
+          $steamApi = Get-ChildItem `
+            -Path $extract `
+            -Recurse `
+            -Filter "steam_api.dll" `
+            -File |
+            Select-Object -First 1
+
+          if ($null -eq $steamApi) {
+            throw "steam_api.dll was not found in the trusted SteamCloudFileManagerLite release archive."
+          }
+
+          Copy-Item `
+            -LiteralPath $steamApi.FullName `
+            -Destination "ui\native\steam_api.dll" `
+            -Force
+
+          Write-Host "Using steam_api.dll from:"
+          Write-Host $steamApi.FullName
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake `
+            -S . `
+            -B build-win `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DCR_GIT_SHA="$env:GITHUB_SHA"
+
+      - name: Build native Windows targets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake `
+            --build build-win `
+            --config Release `
+            --target cloud_redirect cloud_redirect_cli cloud760_tool `
+            --parallel
+
+      - name: Prepare WPF native resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path "ui\native" | Out-Null
+
+          Copy-Item `
+            -LiteralPath "build-win\Release\cloud760_tool.exe" `
+            -Destination "ui\native\cloud760_tool.exe" `
+            -Force
+
+          if (-not (Test-Path -LiteralPath "ui\native\steam_api.dll")) {
+            throw "ui\native\steam_api.dll is missing."
+          }
+
+      - name: Build CloudRedirect WPF application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # The CMake ui target:
+          # 1. Copies cloud_redirect.dll and cloud_redirect_cli.exe to build\Release
+          # 2. Embeds them into the WPF executable
+          # 3. Embeds cloud760_tool.exe and steam_api.dll
+          # 4. Publishes ui\bin\publish\CloudRedirect.exe
+          cmake `
+            --build build-win `
+            --config Release `
+            --target ui `
+            --parallel
+
+      - name: Prepare Windows release files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path release-files | Out-Null
+
+          Copy-Item `
+            -LiteralPath "ui\bin\publish\CloudRedirect.exe" `
+            -Destination "release-files\CloudRedirect.exe" `
+            -Force
+
+          Copy-Item `
+            -LiteralPath "build-win\Release\cloud_redirect.dll" `
+            -Destination "release-files\cloud_redirect.dll" `
+            -Force
+
+          $files = @(
+            "release-files\CloudRedirect.exe",
+            "release-files\cloud_redirect.dll"
+          )
+
+          foreach ($file in $files) {
+            $item = Get-Item -LiteralPath $file
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+            $checksumFile = "$file.sha256"
+            "$hash  $($item.Name)" | Set-Content -LiteralPath $checksumFile -NoNewline
+            Add-Content -LiteralPath $checksumFile -Value ""
+          }
+
+          Get-ChildItem -LiteralPath release-files
+
+      - name: Upload Windows workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudRedirect-windows
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            release-files\CloudRedirect.exe
+            release-files\CloudRedirect.exe.sha256
+            release-files\cloud_redirect.dll
+            release-files\cloud_redirect.dll.sha256
+
+  linux:
+    name: Build Linux release and Flatpak
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo dpkg --add-architecture i386
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            g++-multilib \
+            gcc-multilib \
+            flatpak \
+            flatpak-builder \
+            ninja-build \
+            pkg-config \
+            zstd
+
+          flatpak remote-add --if-not-exists flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+
+          flatpak install --user -y flathub \
+            org.kde.Sdk//6.10 \
+            org.kde.Platform//6.10
+
+      - name: Build 32-bit Linux native targets
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cmake \
+            -S . \
+            -B build-linux32 \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLINUX_32BIT=ON \
+            -DCMAKE_C_FLAGS=-m32 \
+            -DCMAKE_CXX_FLAGS=-m32 \
+            -DCR_GIT_SHA="${GITHUB_SHA}"
+
+          cmake \
+            --build build-linux32 \
+            --target cloud_redirect cloud_redirect_cli \
+            --parallel 2
+
+      - name: Prepare Flatpak native files
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cp build-linux32/cloud_redirect.so \
+            flatpak/cloud_redirect.so
+
+          cp build-linux32/cloud_redirect_cli \
+            flatpak/cloud_redirect_cli
+
+      - name: Build Flatpak bundle
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          flatpak-builder \
+            --user \
+            --force-clean \
+            --disable-rofiles-fuse \
+            --repo=flatpak-repo \
+            flatpak-build \
+            flatpak/org.cloudredirect.CloudRedirect.yml
+
+          flatpak build-bundle \
+            flatpak-repo \
+            release-files-cloudredirect.flatpak \
+            org.cloudredirect.CloudRedirect
+
+      - name: Prepare Linux release files
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p release-files
+
+          cp build-linux32/cloud_redirect.so \
+            release-files/cloud_redirect.so
+
+          cp release-files-cloudredirect.flatpak \
+            release-files/cloudredirect.flatpak
+
+          sha256sum \
+            release-files/cloud_redirect.so \
+            > release-files/cloud_redirect.so.sha256
+
+          sha256sum \
+            release-files/cloudredirect.flatpak \
+            > release-files/cloudredirect.flatpak.sha256
+
+          ls -lh release-files
+
+      - name: Upload Linux workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudRedirect-linux
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            release-files/cloud_redirect.so
+            release-files/cloud_redirect.so.sha256
+            release-files/cloudredirect.flatpak
+            release-files/cloudredirect.flatpak.sha256
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - windows
+      - linux
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: CloudRedirect-windows
+          path: release-files
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: CloudRedirect-linux
+          path: release-files
+
+      - name: List release files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find release-files -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: CloudRedirect ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release-files/CloudRedirect.exe
+            release-files/CloudRedirect.exe.sha256
+            release-files/cloud_redirect.dll
+            release-files/cloud_redirect.dll.sha256
+            release-files/cloud_redirect.so
+            release-files/cloud_redirect.so.sha256
+            release-files/cloudredirect.flatpak
+            release-files/cloudredirect.flatpak.sha256
